@@ -57,6 +57,7 @@ def torch_model(model_name,
         print("=> creating model '{}'".format(model_name))
         model = models.__dict__[model_name]()
     
+    ## RuntimeError: Output 0 of SMPSequentialInputBackward is a view and is being modified inplace. (fixed)
     if model_parallel:
         model.features[1] = nn.ReLU(inplace=False)
         model.features[4] = nn.ReLU(inplace=False)

@@ -49,6 +49,8 @@ try:
 except ImportError:
     pass
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
 
 def train_step(args, model, data, target):
     output = model(data)
@@ -95,36 +97,34 @@ def train(args, model, device, train_loader, optimizer, epoch, scaler):
     start_time = time.time()
     
     for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
+        data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         
         if args.smp:
             output, loss = smp_train_step(args, model, data, target, scaler)
-            
-            if smp.tp_size() > 1:
-                logits = torch.cat(tuple(output.outputs), dim=1)
-            else:
-                logits = torch.cat(tuple(output.outputs), dim=0)
+            logits = torch.cat(tuple(output.outputs), dim=0)
         else:
             logits, loss = train_step(args, model, data, target)
         
         torch.cuda.empty_cache()
         
         optimizer.step()
-        if args.rank == 0:
-            # Measure accuracy
-            prec1, prec5 = util.accuracy(logits, target, topk=(1, 5))
-            
-            if args.smp:
-                loss = loss.reduce_mean()
-            
-            # to_python_float incurs a host<->device sync
-            losses.update(util.to_python_float(loss.item()), data.size(0))
-            top1.update(util.to_python_float(prec1), data.size(0))
-            top5.update(util.to_python_float(prec5), data.size(0))
 
-            # Waiting until finishing operations on GPU (Pytorch default: async)
-            torch.cuda.synchronize()
+        # Measure accuracy
+        prec1, prec5 = util.accuracy(logits, target, topk=(1, 5))
+
+        if args.smp:
+            loss = loss.reduce_mean()
+
+        # to_python_float incurs a host<->device sync
+        losses.update(util.to_python_float(loss), data.size(0))
+        top1.update(util.to_python_float(prec1), data.size(0))
+        top5.update(util.to_python_float(prec5), data.size(0))
+
+        # Waiting until finishing operations on GPU (Pytorch default: async)
+        torch.cuda.synchronize()
+        
+        if args.rank == 0:
 
             if batch_idx % args.log_interval == 0:
                 
@@ -166,20 +166,16 @@ def test(args, model, device, test_loader):
     
     for batch_idx, (data, target) in enumerate(test_loader):
         with torch.no_grad():
-            data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
+            data, target = data.to(device), target.to(device)
             
             if args.smp:
                 output, loss = smp_test_step(args, model, data, target)
-                
-                if smp.tp_size() > 1:
-                    logits = torch.cat(tuple(output.outputs), dim=1)
-                else:
-                    logits = torch.cat(tuple(output.outputs), dim=0)  
+                logits = torch.cat(tuple(output.outputs), dim=0)  
             else:
                 logits, loss = test_step(args, model, data, target)
                 
-            m = {'output' : output.outputs, 'target' : target}
-            torch.save(m, args.save_model + "/test_output")
+#             m = {'output' : output.outputs, 'target' : target}
+#             torch.save(m, args.save_model + "/test_output")
             
             
             prec1, prec5 = util.accuracy(logits, target, topk=(1, 5))
@@ -303,6 +299,8 @@ def main():
     
     args = check_sagemaker(args)
     
+    torch.manual_seed(0)
+    
     if args.smp:
         smp.init()
         args.rank = rank = smp.dp_rank() if not args.prescaled_batch else smp.rdp_rank()
@@ -325,7 +323,7 @@ def main():
 
 #         args.batch_size //= args.world_size // 8
 #         args.batch_size = max(args.batch_size, 1)
-    args.lr = 0.0001 #0.001
+    args.lr = 0.001 # 0.00003 #0.001
     data_path = args.data_path
 
 
@@ -346,7 +344,8 @@ def main():
 
     torch.manual_seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda" if torch.cuda.is_available() else "cpu")
 
     # select a single rank per node to download data
     train_dataset = datasets.ImageFolder(
@@ -426,20 +425,20 @@ def main():
     model = util.torch_model(
         'vgg11',
         num_classes=37,
-        pretrained=True,
+        pretrained=True,  # True,
         local_rank=args.local_rank,
         model_parallel=args.smp)  # 1000 resnext101_32x8d
     
     args.criterion = nn.CrossEntropyLoss().cuda()
-    optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
-#     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+#     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     if args.smp:
         scaler = smp.amp.GradScaler()
     else:
         scaler = None
     
     if args.smp:
-        model = smp.DistributedModel(model, trace_device="gpu")
+        model = smp.DistributedModel(model.to(device), trace_device="gpu", gradient_as_bucket_view=True)
         optimizer = smp.DistributedOptimizer(optimizer)
     else:
         model = DDP(model.to(device),
